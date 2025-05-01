@@ -4,7 +4,7 @@
  * - Uses few-shot examples with clear delimiters
  */
 
-import OpenAI from "openai";
+import { Anthropic } from "@anthropic-ai/sdk";
 import { useEnvConfig } from "../store";
 
 export interface TranslatorResponse {
@@ -80,12 +80,11 @@ const EXAMPLES: Array<{input: string; output: TranslatorResponse}> = [
   }
 ];
 
-const { OPENAI_API_KEY } = useEnvConfig.getState().config;
+const { ANTHROPIC_API_KEY } = useEnvConfig.getState().config;
 
-const openai = new OpenAI({
+const anthropic = new Anthropic({
   /** 🔒 Proxy this in prod instead of exposing the key */ 
-  apiKey: OPENAI_API_KEY ?? "",
-  dangerouslyAllowBrowser: true,
+  apiKey: ANTHROPIC_API_KEY ?? "",
 });
 
 // Store conversation history
@@ -100,25 +99,25 @@ export async function translateUserGoal(
 ): Promise<TranslatorResponse> {
   const messages = buildMessages(userInput);
 
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages,
-    response_format: { type: "json_object" },
+  const completion = await anthropic.messages.create({
+    model: "claude-3-5-sonnet-20241022",
+    messages: [
+      { role: "user", content: `System: ${messages.system}` },
+      ...messages.conversation
+    ],
     temperature: 0.2,
+    max_tokens: 1000
   });
 
-  const choice = completion.choices[0];
-
-  // Safety & truncation checks
-  if (choice.finish_reason !== "stop") {
-    throw new Error(`Model stopped early: ${choice.finish_reason}`);
-  }
-  if (choice.message.refusal) {
-    throw new Error(`Model refused: ${choice.message.refusal}`);
+  // Safety checks for response
+  const content = completion.content[0].type === 'text' ? completion.content[0].text : '';
+  if (!content) {
+    throw new Error("Model returned empty response");
   }
 
-  const content = choice.message.content?.trim();
-  if (!content?.startsWith("{")) throw new Error("Model did not return JSON");  
+  if (!content.startsWith("{")) {
+    throw new Error("Model did not return valid JSON");
+  }  
 
   const parsed = JSON.parse(content) as TranslatorResponse;
   const result = cleanResponse(parsed, userInput);
@@ -145,44 +144,40 @@ export function clearConversationHistory(): void {
 /* ---------- helpers ---------- */
 
 function buildMessages(userInput: string) {
-  const msgs: OpenAI.ChatCompletionMessageParam[] = [
-    {
-      role: "system",
-      content:
-        "You are MidsceneTranslator. Convert Chinese shopping instructions to JSON with focused, single-step actions.\n\n" +
-        "IMPORTANT RULES:\n" +
-        "1. Provide ONLY ONE STEP at a time - do not chain multiple actions.\n" +
-        "2. PAY ATTENTION TO CONTEXT - if user previously searched for a product, treat single words as selections from search results, not new searches.\n" +
-        "3. If input starts with words like '搜索', '查找', or is a full request, search for it.\n" +
-        "4. If input is a brand name, product name, or short phrase after a search, CLICK it instead of searching again.\n" +
-        "5. Never automatically add 'add to cart' unless explicitly requested.\n" +
-        "6. Make summary match exactly what the command will do - no more, no less.\n\n" +
-        "7. ALWAYS respond with **only** a single JSON object—no code blocks, no prose.\n\n" +
-        "==== EXAMPLES (NOT ACTUAL CONVERSATION) ====\n"
-    },
-  ];
+  // System message for Anthropic API
+  const systemMessage = 
+    "You are MidsceneTranslator. Convert Chinese shopping instructions to JSON with focused, single-step actions.\n\n" +
+    "IMPORTANT RULES:\n" +
+    "1. Provide ONLY ONE STEP at a time - do not chain multiple actions.\n" +
+    "2. PAY ATTENTION TO CONTEXT - if user previously searched for a product, treat single words as selections from search results, not new searches.\n" +
+    "3. If input starts with words like '搜索', '查找', or is a full request, search for it.\n" +
+    "4. If input is a brand name, product name, or short phrase after a search, CLICK it instead of searching again.\n" +
+    "5. Never automatically add 'add to cart' unless explicitly requested.\n" +
+    "6. Make summary match exactly what the command will do - no more, no less.\n\n" +
+    "7. ALWAYS respond with **only** a single JSON object with exactly the format {\"goal\": string, \"midscene_prompt\": string, \"summary\": string[]}. No explanations, no comments, just the JSON.\n\n" +
+    "==== EXAMPLES (NOT ACTUAL CONVERSATION) ====\n";
 
-  // Add few-shot examples with clear delimiter
+  // Build conversation messages array for Anthropic API
+  const conversationMsgs: Array<{role: 'user' | 'assistant', content: string}> = [];
+
+  // Add few-shot examples
   for (const ex of EXAMPLES) {
-    msgs.push({ role: "user", content: ex.input });
-    msgs.push({ role: "assistant", content: JSON.stringify(ex.output) });
+    conversationMsgs.push({ role: 'user', content: ex.input });
+    conversationMsgs.push({ role: 'assistant', content: JSON.stringify(ex.output) });
   }
-  
-  // Add delimiter to separate examples from actual conversation
-  msgs.push({ 
-    role: "system", 
-    content: "==== END EXAMPLES. ACTUAL CONVERSATION HISTORY FOLLOWS ===="
-  });
   
   // Add conversation history if available
   if (conversationHistory.length > 0) {
-    msgs.push(...conversationHistory);
+    conversationMsgs.push(...conversationHistory);
   }
   
   // Add current request
-  msgs.push({ role: "user", content: userInput });
+  conversationMsgs.push({ role: 'user', content: userInput });
   
-  return msgs;
+  return {
+    system: systemMessage,
+    conversation: conversationMsgs
+  };
 }
 
 function cleanResponse(
@@ -197,84 +192,72 @@ function cleanResponse(
   return { goal: res.goal || original, midscene_prompt: prompt, summary };
 }
 
-// Add to translator.ts
 /**
  * Regenerates a midscene_prompt based on user-edited summary steps
  */
 export async function regeneratePlanFromSummary(
-    editedSummary: string[],
-    originalGoal: string,
-    originalPrompt?: string // Pass the original prompt for context
-  ): Promise<TranslatorResponse> {
-    const messages: OpenAI.ChatCompletionMessageParam[] = [
-      {
-        role: "system",
-        content: 
-          "You are MidsceneTranslator, converting shopping instructions to precise browser automation commands.\n\n" +
-          "The user has edited the summary steps of an automation plan. You need to generate a new midscene_prompt " +
-          "that accomplishes exactly these edited steps.\n\n" +
-          "Rules:\n" +
-          "1. ONLY generate the midscene_prompt field - the summary is already finalized by the user\n" +
-          "2. Each step in the summary must be reflected in your generated midscene_prompt\n" +
-          "3. Your midscene_prompt must use valid browser commands like 'click', 'type', 'wait', etc.\n" +
-          "4. Separate commands with commas\n" +
-          "5. Keep focused on the edited steps - don't add extra actions\n\n" +
-          "RESPOND WITH JSON ONLY - {\"midscene_prompt\": \"your commands here\"}"
-      },
-      {
-        role: "user",
-        content: 
-          `Original goal: ${originalGoal}\n` +
-          `${originalPrompt ? `Original midscene_prompt: ${originalPrompt}\n` : ''}` +
-          `User-edited summary steps: ${JSON.stringify(editedSummary)}\n\n` +
-          `Create a new midscene_prompt that matches these edited steps exactly.`
-      }
-    ];
-  
-    try {
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4o",
-        messages,
-        response_format: { type: "json_object" },
-        temperature: 0.2,
-      });
-  
-      // Safety & truncation checks
-      const choice = completion.choices[0];
-      if (choice.finish_reason !== "stop") {
-        throw new Error(`Model stopped early: ${choice.finish_reason}`);
-      }
-      if (choice.message.refusal) {
-        throw new Error(`Model refused: ${choice.message.refusal}`);
-      }
-  
-      const content = choice.message.content?.trim();
-      if (!content || !content.startsWith("{")) {
-        throw new Error("Model did not return valid JSON");
-      }  
-  
-      // Parse just the midscene_prompt from the response
-      const parsedResponse = JSON.parse(content);
-      const newPrompt = parsedResponse.midscene_prompt;
-      
-      if (!newPrompt || typeof newPrompt !== 'string') {
-        throw new Error("Missing or invalid midscene_prompt in response");
-      }
-  
-      // Clean up the prompt similar to how we do in translateUserGoal
-      const cleanedPrompt = newPrompt
-        .replace(/\s*,\s*/g, ", ")
-        .replace(/\s*then\s*/gi, ", ")
-        .trim();
-  
-      // Return the new response with user-edited summary
-      return {
-        goal: originalGoal,
-        midscene_prompt: cleanedPrompt,
-        summary: editedSummary // Keep the user's edited summary as-is
-      };
-    } catch (error) {
-      console.error("Error regenerating plan:", error);
-      throw new Error(`Failed to regenerate plan: ${error instanceof Error ? error.message : String(error)}`);
+  editedSummary: string[],
+  originalGoal: string,
+  originalPrompt?: string // Pass the original prompt for context
+): Promise<TranslatorResponse> {
+  const systemPrompt = 
+    "You are MidsceneTranslator, converting shopping instructions to precise browser automation commands.\n\n" +
+    "The user has edited the summary steps of an automation plan. You need to generate a new midscene_prompt " +
+    "that accomplishes exactly these edited steps.\n\n" +
+    "Rules:\n" +
+    "1. ONLY generate the midscene_prompt field - the summary is already finalized by the user\n" +
+    "2. Each step in the summary must be reflected in your generated midscene_prompt\n" +
+    "3. Your midscene_prompt must use valid browser commands like 'click', 'type', 'wait', etc.\n" +
+    "4. Separate commands with commas\n" +
+    "5. Keep focused on the edited steps - don't add extra actions\n\n" +
+    "RESPOND WITH STRICTLY ONLY THIS JSON OBJECT FORMAT - {\"midscene_prompt\": \"your commands here\"}\n" +
+    "Do not add ANY text before or after the JSON. No explanations, no comments, just pure JSON.";
+
+  const userMessage = 
+    `Original goal: ${originalGoal}\n` +
+    `${originalPrompt ? `Original midscene_prompt: ${originalPrompt}\n` : ''}` +
+    `User-edited summary steps: ${JSON.stringify(editedSummary)}\n\n` +
+    `Create a new midscene_prompt that matches these edited steps exactly.`;
+
+  try {
+    const completion = await anthropic.messages.create({
+      model: "claude-3-5-sonnet-20241022",
+      messages: [
+        { role: "user", content: `System: ${systemPrompt}` },
+        { role: "user", content: userMessage }
+      ],
+      temperature: 0.2,
+      max_tokens: 1000
+    });
+
+    // Get response content
+    const content = completion.content[0].type === 'text' ? completion.content[0].text : '';
+    if (!content || !content.startsWith("{")) {
+      throw new Error("Model did not return valid JSON");
+    }  
+
+    // Parse just the midscene_prompt from the response
+    const parsedResponse = JSON.parse(content);
+    const newPrompt = parsedResponse.midscene_prompt;
+    
+    if (!newPrompt || typeof newPrompt !== 'string') {
+      throw new Error("Missing or invalid midscene_prompt in response");
     }
+
+    // Clean up the prompt similar to how we do in translateUserGoal
+    const cleanedPrompt = newPrompt
+      .replace(/\s*,\s*/g, ", ")
+      .replace(/\s*then\s*/gi, ", ")
+      .trim();
+
+    // Return the new response with user-edited summary
+    return {
+      goal: originalGoal,
+      midscene_prompt: cleanedPrompt,
+      summary: editedSummary // Keep the user's edited summary as-is
+    };
+  } catch (error) {
+    console.error("Error regenerating plan:", error);
+    throw new Error(`Failed to regenerate plan: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
